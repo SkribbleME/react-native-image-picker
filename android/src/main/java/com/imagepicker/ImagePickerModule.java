@@ -2,37 +2,36 @@ package com.imagepicker;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
-import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.BitmapFactory.Options;
 import android.graphics.Matrix;
+import android.graphics.drawable.ColorDrawable;
 import android.media.ExifInterface;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
-import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
-import android.support.v4.content.FileProvider;
 import android.util.Base64;
 import android.util.Log;
+import android.widget.ArrayAdapter;
 import android.webkit.MimeTypeMap;
 import android.content.pm.PackageManager;
 import android.media.MediaScannerConnection;
 
-import com.facebook.react.bridge.ActivityEventListener;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Callback;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.WritableMap;
-import com.imagepicker.utils.RealPathUtil;
-import com.imagepicker.utils.UI;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -47,23 +46,31 @@ import java.net.URL;
 import java.text.DateFormat;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
 import java.util.UUID;
 
-public class ImagePickerModule extends ReactContextBaseJavaModule implements ActivityEventListener {
+interface ActivityResultInterface {
+  void callback(int requestCode, int resultCode, Intent data);
+}
+
+public class ImagePickerModule extends ReactContextBaseJavaModule {
 
   static final int REQUEST_LAUNCH_IMAGE_CAPTURE = 13001;
   static final int REQUEST_LAUNCH_IMAGE_LIBRARY = 13002;
   static final int REQUEST_LAUNCH_VIDEO_LIBRARY = 13003;
   static final int REQUEST_LAUNCH_VIDEO_CAPTURE = 13004;
 
-  private final ReactApplicationContext reactContext;
+  private final ReactApplicationContext mReactContext;
+  private ImagePickerActivityEventListener mActivityEventListener;
 
-  private Uri cameraCaptureURI;
-  private Callback callback;
+  private Uri mCameraCaptureURI;
+  private Callback mCallback;
   private Boolean noData = false;
+  private Boolean tmpImage;
   private Boolean pickVideo = false;
   private int maxWidth = 0;
   private int maxHeight = 0;
@@ -76,9 +83,15 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
   public ImagePickerModule(ReactApplicationContext reactContext) {
     super(reactContext);
 
-    this.reactContext = reactContext;
+    mReactContext = reactContext;
 
-    reactContext.addActivityEventListener(this);
+    mActivityEventListener = new ImagePickerActivityEventListener(reactContext, new ActivityResultInterface() {
+      @Override
+      public void callback(int requestCode, int resultCode, Intent data) {
+        onActivityResult(requestCode, resultCode, data);
+      }
+    });
+
   }
 
   @Override
@@ -90,52 +103,90 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
   public void showImagePicker(final ReadableMap options, final Callback callback) {
     Activity currentActivity = getCurrentActivity();
 
-    if (currentActivity == null)
-    {
-      cleanResponse();
+    if (currentActivity == null) {
+      response = Arguments.createMap();
       response.putString("error", "can't find current Activity");
       callback.invoke(response);
       return;
     }
 
-    UI.showDialog(currentActivity, options, new UI.OnAction()
-    {
-      @Override
-      public void onTakePhoto()
-      {
-        launchCamera(options, callback);
-      }
+    final List<String> titles = new ArrayList<String>();
+    final List<String> actions = new ArrayList<String>();
 
-      @Override
-      public void onUseLibrary()
-      {
-        launchImageLibrary(options, callback);
+    if (options.hasKey("takePhotoButtonTitle")
+            && options.getString("takePhotoButtonTitle") != null
+            && !options.getString("takePhotoButtonTitle").isEmpty()
+            && isCameraAvailable()) {
+      titles.add(options.getString("takePhotoButtonTitle"));
+      actions.add("photo");
+    }
+    if (options.hasKey("chooseFromLibraryButtonTitle")
+            && options.getString("chooseFromLibraryButtonTitle") != null
+            && !options.getString("chooseFromLibraryButtonTitle").isEmpty()) {
+      titles.add(options.getString("chooseFromLibraryButtonTitle"));
+      actions.add("library");
+    }
+    if (options.hasKey("customButtons")) {
+      ReadableArray customButtons = options.getArray("customButtons");
+      for (int i = 0; i < customButtons.size(); i++) {
+        ReadableMap button = customButtons.getMap(i);
+        int currentIndex = titles.size();
+        titles.add(currentIndex, button.getString("title"));
+        actions.add(currentIndex, button.getString("name"));
       }
+    }
+    if (options.hasKey("cancelButtonTitle")
+            && options.getString("cancelButtonTitle") != null
+            && !options.getString("cancelButtonTitle").isEmpty()) {
+      titles.add(options.getString("cancelButtonTitle"));
+      actions.add("cancel");
+    }
 
+    ArrayAdapter<String> adapter = new ArrayAdapter<String>(currentActivity, android.R.layout.select_dialog_item, titles);
+    AlertDialog.Builder builder = new AlertDialog.Builder(currentActivity, android.R.style.Theme_Holo_Light_Dialog);
+    if (options.hasKey("title") && options.getString("title") != null && !options.getString("title").isEmpty()) {
+      builder.setTitle(options.getString("title"));
+    }
+
+    builder.setAdapter(adapter, new DialogInterface.OnClickListener() {
+      public void onClick(DialogInterface dialog, int index) {
+        String action = actions.get(index);
+        response = Arguments.createMap();
+
+        switch (action) {
+          case "photo":
+            launchCamera(options, callback);
+            break;
+          case "library":
+            launchImageLibrary(options, callback);
+            break;
+          case "cancel":
+            response.putBoolean("didCancel", true);
+            callback.invoke(response);
+            break;
+          default: // custom button
+            response.putString("customButton", action);
+            callback.invoke(response);
+        }
+      }
+    });
+
+    final AlertDialog dialog = builder.create();
+    /**
+     * override onCancel method to callback cancel in case of a touch outside of
+     * the dialog or the BACK key pressed
+     */
+    dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
       @Override
-      public void onCancel()
-      {
-        cleanResponse();
+      public void onCancel(DialogInterface dialog) {
+        response = Arguments.createMap();
+        dialog.dismiss();
         response.putBoolean("didCancel", true);
         callback.invoke(response);
       }
-
-      @Override
-      public void onCustomButton(@NonNull final String action)
-      {
-        cleanResponse();
-        response.putString("customButton", action);
-        callback.invoke(response);
-      }
-
-      @Override
-      public void onDialogWasCanceled(@NonNull final String action)
-      {
-        cleanResponse();
-        response.putBoolean(action, true);
-        callback.invoke(response);
-      }
     });
+    dialog.getWindow().setBackgroundDrawable(new ColorDrawable(android.graphics.Color.TRANSPARENT));
+    dialog.show();
   }
 
   // NOTE: Currently not reentrant / doesn't support concurrent requests
@@ -177,17 +228,17 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
 
       // we create a tmp file to save the result
       File imageFile = createNewFile();
-      cameraCaptureURI = compatUriFromFile(reactContext, imageFile);
-      cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, cameraCaptureURI);
+      mCameraCaptureURI = Uri.fromFile(imageFile);
+      cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, mCameraCaptureURI);
     }
 
-    if (cameraIntent.resolveActivity(reactContext.getPackageManager()) == null) {
+    if (cameraIntent.resolveActivity(mReactContext.getPackageManager()) == null) {
       response.putString("error", "Cannot launch camera");
       callback.invoke(response);
       return;
     }
 
-    this.callback = callback;
+    mCallback = callback;
 
     try {
       currentActivity.startActivityForResult(cameraIntent, requestCode);
@@ -229,13 +280,13 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
       MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
     }
 
-    if (libraryIntent.resolveActivity(reactContext.getPackageManager()) == null) {
+    if (libraryIntent.resolveActivity(mReactContext.getPackageManager()) == null) {
       response.putString("error", "Cannot launch photo library");
       callback.invoke(response);
       return;
     }
 
-    this.callback = callback;
+    mCallback = callback;
 
     try {
       currentActivity.startActivityForResult(libraryIntent, requestCode);
@@ -246,9 +297,9 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
     }
   }
 
-  public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+  public void onActivityResult(final int requestCode, final int resultCode, final Intent data) {
     //robustness code
-    if (callback == null || (cameraCaptureURI == null && requestCode == REQUEST_LAUNCH_IMAGE_CAPTURE)
+    if (mCallback == null || (mCameraCaptureURI == null && requestCode == REQUEST_LAUNCH_IMAGE_CAPTURE)
             || (requestCode != REQUEST_LAUNCH_IMAGE_CAPTURE && requestCode != REQUEST_LAUNCH_IMAGE_LIBRARY
             && requestCode != REQUEST_LAUNCH_VIDEO_LIBRARY && requestCode != REQUEST_LAUNCH_VIDEO_CAPTURE)) {
       return;
@@ -259,15 +310,15 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
     // user cancel
     if (resultCode != Activity.RESULT_OK) {
       response.putBoolean("didCancel", true);
-      callback.invoke(response);
-      callback = null;
+      mCallback.invoke(response);
+      mCallback = null;
       return;
     }
 
     Uri uri;
     switch (requestCode) {
       case REQUEST_LAUNCH_IMAGE_CAPTURE:
-        uri = cameraCaptureURI;
+        uri = mCameraCaptureURI;
         this.fileScan(uri.getPath());
         break;
       case REQUEST_LAUNCH_IMAGE_LIBRARY:
@@ -276,15 +327,15 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
       case REQUEST_LAUNCH_VIDEO_LIBRARY:
         response.putString("uri", data.getData().toString());
         response.putString("path", getRealPathFromURI(data.getData()));
-        callback.invoke(response);
-        callback = null;
+        mCallback.invoke(response);
+        mCallback = null;
         return;
       case REQUEST_LAUNCH_VIDEO_CAPTURE:
         response.putString("uri", data.getData().toString());
         response.putString("path", getRealPathFromURI(data.getData()));
         this.fileScan(response.getString("path"));
-        callback.invoke(response);
-        callback = null;
+        mCallback.invoke(response);
+        mCallback = null;
         return;
       default:
         uri = null;
@@ -312,8 +363,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
         // image not in cache
         response.putString("error", "Could not read photo");
         response.putString("uri", uri.toString());
-        callback.invoke(response);
-        callback = null;
+        mCallback.invoke(response);
+        mCallback = null;
         return;
       }
     }
@@ -363,8 +414,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
     } catch (IOException e) {
       e.printStackTrace();
       response.putString("error", e.getMessage());
-      callback.invoke(response);
-      callback = null;
+      mCallback.invoke(response);
+      mCallback = null;
       return;
     }
 
@@ -400,8 +451,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
 
     putExtraFileInfo(realPath, response);
 
-    callback.invoke(response);
-    callback = null;
+    mCallback.invoke(response);
+    mCallback = null;
   }
 
   /**
@@ -455,12 +506,23 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
   }
 
   private boolean isCameraAvailable() {
-    return reactContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA)
-      || reactContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY);
+    return mReactContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA)
+      || mReactContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY);
   }
 
-  private @NonNull String getRealPathFromURI(@NonNull final Uri uri) {
-    return RealPathUtil.getRealPathFromURI(reactContext, uri);
+  private String getRealPathFromURI(Uri uri) {
+    String result;
+    String[] projection = {MediaStore.Images.Media.DATA};
+    Cursor cursor = mReactContext.getContentResolver().query(uri, projection, null, null, null);
+    if (cursor == null) { // Source is Dropbox or other similar local file path
+      result = uri.getPath();
+    } else {
+      cursor.moveToFirst();
+      int idx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATA);
+      result = cursor.getString(idx);
+      cursor.close();
+    }
+    return result;
   }
 
   /**
@@ -475,8 +537,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
    * @throws Exception
    */
   private File createFileFromURI(Uri uri) throws Exception {
-    File file = new File(reactContext.getExternalCacheDir(), "photo-" + uri.getLastPathSegment());
-    InputStream input = reactContext.getContentResolver().openInputStream(uri);
+    File file = new File(mReactContext.getExternalCacheDir(), "photo-" + uri.getLastPathSegment());
+    InputStream input = mReactContext.getContentResolver().openInputStream(uri);
     OutputStream output = new FileOutputStream(file);
 
     try {
@@ -602,11 +664,13 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
    * @return an empty file
    */
   private File createNewFile() {
-    String filename = new StringBuilder("image-")
-            .append(UUID.randomUUID().toString())
-            .append(".jpg")
-            .toString();
-    File path = reactContext.getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+    String filename = "image-" + UUID.randomUUID().toString() + ".jpg";
+    File path;
+    if (tmpImage) {
+      path = mReactContext.getExternalCacheDir();
+    } else {
+      path = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
+    }
 
     File f = new File(path, filename);
     try {
@@ -653,6 +717,10 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
     if (options.hasKey("quality")) {
       quality = (int) (options.getDouble("quality") * 100);
     }
+    tmpImage = true;
+    if (options.hasKey("storageOptions")) {
+      tmpImage = false;
+    }
     rotation = 0;
     if (options.hasKey("rotation")) {
       rotation = options.getInt("rotation");
@@ -671,8 +739,8 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
     }
   }
 
-  public void fileScan(String path) {
-    MediaScannerConnection.scanFile(reactContext,
+  public void fileScan(String path){
+    MediaScannerConnection.scanFile(mReactContext,
             new String[] { path }, null,
             new MediaScannerConnection.OnScanCompletedListener() {
 
@@ -682,29 +750,6 @@ public class ImagePickerModule extends ReactContextBaseJavaModule implements Act
             });
   }
 
-  // Required for ActivityEventListener
+  // Required for RN 0.30+ modules than implement ActivityEventListener
   public void onNewIntent(Intent intent) { }
-
-  // Some people need this for compilation
-  public void onActivityResult(int requestCode, int resultCode, Intent data) { }
-
-  private void cleanResponse()
-  {
-    response = Arguments.createMap();
-  }
-
-  private static Uri compatUriFromFile(@NonNull final Context context, @NonNull final File file) {
-    Uri result = null;
-    if (Build.VERSION.SDK_INT < 19)
-    {
-      result = Uri.fromFile(file);
-    }
-    else
-    {
-      final String packageName = context.getApplicationContext().getPackageName();
-      final String authority =  new StringBuilder(packageName).append(".provider").toString();
-      result = FileProvider.getUriForFile(context, authority, file);
-    }
-    return result;
-  }
 }
