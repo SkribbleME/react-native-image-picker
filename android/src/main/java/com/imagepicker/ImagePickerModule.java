@@ -421,7 +421,7 @@ public class ImagePickerModule extends ReactContextBaseJavaModule {
 
     BitmapFactory.Options options = new BitmapFactory.Options();
     options.inJustDecodeBounds = false;
-    options.inPreferredConfig = Config.RGB_565;
+    options.inPreferredConfig = Bitmap.Config.RGB_565;
     options.inDither = true;
     BitmapFactory.decodeFile(realPath, options);
     int initialWidth = options.outWidth;
